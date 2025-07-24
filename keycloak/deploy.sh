@@ -130,6 +130,10 @@ deploy_environment() {
   local config_file
 
   case "$env" in
+    dev)
+      ingress_config_file="keycloak/dev/keycloak-ingress_template.yaml"
+      config_file="keycloak/dev/keycloak.yaml"
+      ;;
     homolog)
       ingress_config_file="keycloak/homolog/keycloak-ingress_template.yaml"
       config_file="keycloak/homolog/keycloak.yaml"
