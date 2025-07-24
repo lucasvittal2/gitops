@@ -52,6 +52,52 @@ if [[ -z "$ENV" ]]; then
   exit 1
 fi
 
+# Function to fix NGINX Ingress Controller issues
+fix_ingress_controller() {
+  log_info "Checking NGINX Ingress Controller status..."
+  
+  # Check if ingress addon is enabled
+  if ! minikube addons list | grep -q "ingress.*enabled"; then
+    log_info "Enabling Minikube ingress addon..."
+    minikube addons enable ingress
+    
+    # Wait for ingress controller to be ready
+    log_info "Waiting for ingress controller to be ready..."
+    kubectl wait --namespace ingress-nginx \
+      --for=condition=ready pod \
+      --selector=app.kubernetes.io/component=controller \
+      --timeout=300s
+  fi
+  
+  # Check if admission webhook is causing issues
+  if kubectl get validatingwebhookconfiguration ingress-nginx-admission &>/dev/null; then
+    log_info "Checking admission webhook health..."
+    
+    # Test if webhook is responsive
+    if ! kubectl get pods -n ingress-nginx | grep -q "ingress-nginx-controller.*Running"; then
+      log_warning "Ingress controller pods not running properly"
+      
+      # Restart the ingress addon
+      log_info "Restarting ingress addon..."
+      minikube addons disable ingress
+      sleep 5
+      minikube addons enable ingress
+      
+      # Wait for controller to be ready
+      kubectl wait --namespace ingress-nginx \
+        --for=condition=ready pod \
+        --selector=app.kubernetes.io/component=controller \
+        --timeout=300s
+    fi
+    
+    # If still having issues, temporarily disable admission webhook
+    if ! kubectl get svc ingress-nginx-controller-admission -n ingress-nginx &>/dev/null; then
+      log_warning "Admission webhook service not found, disabling validation temporarily"
+      kubectl delete validatingwebhookconfiguration ingress-nginx-admission --ignore-not-found
+    fi
+  fi
+}
+
 # Function to safely apply or recreate Kubernetes resources
 apply_keycloak_resources() {
   local ingress_config_file=$1
@@ -73,34 +119,71 @@ apply_keycloak_resources() {
       kubectl delete statefulset keycloak --ignore-not-found
       kubectl delete deployment postgres --ignore-not-found
       kubectl delete service postgres --ignore-not-found
+      kubectl delete ingress keycloak-ingress --ignore-not-found
 
       sleep 5
 
       log_info "Applying fresh Keycloak configuration..."
       kubectl apply -f "$config_file"
-      kubectl apply -f "$resolved_ingress_config"
+      
+      # Apply ingress with retry logic
+      apply_ingress_with_retry "$resolved_ingress_config"
     else
       log_info "Attempting to update existing resources..."
 
-      if kubectl replace -f "$resolved_ingress_config" --force; then
-        log_success "Resources replaced successfully"
+      # Delete existing ingress first to avoid conflicts
+      kubectl delete ingress keycloak-ingress --ignore-not-found
+      sleep 2
+
+      if kubectl apply -f "$config_file"; then
+        apply_ingress_with_retry "$resolved_ingress_config"
+        log_success "Resources updated successfully"
       else
-        log_warning "Replace failed, falling back to delete-and-apply..."
+        log_warning "Update failed, falling back to delete-and-apply..."
 
         kubectl delete service keycloak --ignore-not-found
         sleep 2
 
         kubectl apply -f "$config_file"
-        kubectl apply -f "$resolved_ingress_config"
+        apply_ingress_with_retry "$resolved_ingress_config"
       fi
     fi
   else
     log_info "No existing Keycloak service found, applying configuration..."
     kubectl apply -f "$config_file"
-    kubectl apply -f "$resolved_ingress_config"
+    apply_ingress_with_retry "$resolved_ingress_config"
   fi
 
   rm -f "$resolved_ingress_config"
+}
+
+# Function to apply ingress with retry logic
+apply_ingress_with_retry() {
+  local ingress_file=$1
+  local max_attempts=3
+  local attempt=1
+  
+  while [[ $attempt -le $max_attempts ]]; do
+    log_info "Applying ingress configuration (attempt $attempt/$max_attempts)..."
+    
+    if kubectl apply -f "$ingress_file"; then
+      log_success "Ingress applied successfully"
+      return 0
+    else
+      log_warning "Ingress application failed on attempt $attempt"
+      
+      if [[ $attempt -eq $max_attempts ]]; then
+        log_error "Failed to apply ingress after $max_attempts attempts"
+        log_info "You can manually apply the ingress later with: kubectl apply -f $ingress_file"
+        return 1
+      fi
+      
+      # Wait and fix ingress controller before next attempt
+      sleep 10
+      fix_ingress_controller
+      ((attempt++))
+    fi
+  done
 }
 
 # Function to wait for PostgreSQL to be ready
@@ -155,13 +238,14 @@ deploy_environment() {
   fi
 
   log_info "Starting deployment for $env environment..."
+  
+  # Fix ingress controller issues before deployment
+  fix_ingress_controller
+  
   apply_keycloak_resources "$ingress_config_file" "$config_file"
 
   wait_for_postgres
   wait_for_keycloak
-
-  log_info "Enabling Ingress addon for Minikube..."
-  minikube addons enable ingress &>/dev/null
 
   local ip
   ip=$(minikube ip)
