@@ -47,7 +47,7 @@ Follow these steps to deploy Keycloak on Minikube:
 ### 1. Start Minikube
 Ensure Minikube is running with the necessary add-ons:
 ```bash
-minikube start
+minikube start --driver=docker
 minikube addons enable ingress
 ```
 
